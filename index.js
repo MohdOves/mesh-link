@@ -31,13 +31,17 @@ import App from './src/App.js';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const UDP_PORT = 41234;
-const UDP_BROADCAST_INTERVAL = 2000; // 2 seconds
+const UDP_BURST_INTERVAL = 300;      // 300ms during initial burst phase
+const UDP_STEADY_INTERVAL = 2000;    // 2s after burst phase
+const UDP_BURST_DURATION = 10000;    // burst for first 10 seconds
 const SEEN_MSG_TTL = 60000;          // 60 seconds before purging seen msgIds
 const DEFAULT_MSG_TTL = 10;          // default hop limit for messages
 const RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY = 2000;        // 2 seconds
+const RECONNECT_DELAY = 500;         // 500ms between reconnect attempts
 const HEARTBEAT_INTERVAL = 5000;     // 5 seconds between heartbeat pings
-const RELAY_COOLDOWN = 10000;        // 10 seconds between relaying same peer
+const RELAY_COOLDOWN = 3000;         // 3 seconds between relaying same peer
+
+const startupTime = Date.now();       // used for UDP burst mode timing
 
 // Generate unique node ID: "node-" + 6 random hex chars
 const nodeId = 'node-' + crypto.randomBytes(3).toString('hex');
@@ -191,18 +195,25 @@ function addChatMessage(fromNodeId, text, type, hops) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SEEN MESSAGES CLEANUP
-// Periodically purge msgIds older than 60 seconds to prevent memory leak.
+// SEEN MESSAGES — LAZY CLEANUP
+// Instead of a scheduled sweep, expired entries are deleted inline during
+// lookup. This avoids setInterval overhead and cleans exactly when needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [msgId, ts] of seenMessages) {
-    if (now - ts > SEEN_MSG_TTL) {
-      seenMessages.delete(msgId);
-    }
+/**
+ * hasSeenMessage — Check if a msgId has been seen before.
+ * If the entry exists but is expired (>SEEN_MSG_TTL), delete it and return false.
+ * This is lazy cleanup: no scheduled sweep, entries die on next access.
+ */
+function hasSeenMessage(msgId) {
+  const ts = seenMessages.get(msgId);
+  if (ts === undefined) return false;
+  if (Date.now() - ts > SEEN_MSG_TTL) {
+    seenMessages.delete(msgId);
+    return false; // expired — treat as unseen
   }
-}, 10000); // run cleanup every 10 seconds
+  return true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODULE 4: GOSSIP ROUTER
@@ -241,7 +252,7 @@ function handleIncomingMessage(envelope, senderPeerId) {
   // If yes, DROP it immediately. This prevents:
   //   - Infinite message loops in cyclic topologies
   //   - Duplicate deliveries when multiple peers forward the same message
-  if (seenMessages.has(msgId)) {
+  if (hasSeenMessage(msgId)) {
     return; // Already processed — drop silently
   }
 
@@ -312,19 +323,15 @@ function handleIncomingMessage(envelope, senderPeerId) {
     return a[1].connectedAt - b[1].connectedAt; // older connection first
   });
 
-  for (const [peerId, peer] of sortedPeers) {
-    // Don't send back to whoever sent it to us
-    if (peerId === senderPeerId) continue;
-    // Don't send to the original author
-    if (peerId === fromNodeId) continue;
-    // Don't send to nodes already in the path (they've seen it)
-    if (newPath.includes(peerId)) continue;
-
-    // Send to this peer
+  // Forward simultaneously to all eligible peers using forEach
+  sortedPeers.forEach(([peerId, peer]) => {
+    if (peerId === senderPeerId) return;        // Don't echo back to sender
+    if (peerId === fromNodeId) return;           // Don't send to original author
+    if (newPath.includes(peerId)) return;        // Don't send to nodes in path
     if (peer.ws.readyState === WebSocket.OPEN) {
       peer.ws.send(serialized);
     }
-  }
+  });
 }
 
 /**
@@ -370,10 +377,63 @@ function sendMessage(text, type = 'CHAT') {
 
   // Flood to all peers
   const serialized = JSON.stringify(envelope);
-  for (const [peerId, peer] of peers) {
+  // Send simultaneously to all peers using forEach
+  peers.forEach((peer) => {
     if (peer.ws.readyState === WebSocket.OPEN) {
       peer.ws.send(serialized);
     }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PEER LIST EXCHANGE
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// When a new peer connects (inbound or outbound), immediately share our
+// known peer list with them. This lets new nodes discover the entire mesh
+// instantly without waiting for individual UDP broadcasts to find each peer.
+// This is what creates true full-duplex mesh — every node knows about
+// every other node within milliseconds of joining.
+//
+
+/**
+ * sendPeerList — Share our known peers with a newly connected peer.
+ * Sends a PEER_EXCHANGE message containing all peers we know about
+ * (excluding the recipient themselves).
+ *
+ * @param {WebSocket} ws - The WebSocket to send the peer list on
+ * @param {string} excludeNodeId - Don't include this peer in the list
+ */
+function sendPeerList(ws, excludeNodeId) {
+  const peerInfo = [];
+  for (const [id, p] of peers) {
+    if (id === excludeNodeId) continue;
+    peerInfo.push({ nodeId: id, ip: p.ip, port: p.port });
+  }
+  if (peerInfo.length > 0 && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'PEER_EXCHANGE', peers: peerInfo, fromNodeId: nodeId }));
+  }
+}
+
+/**
+ * handlePeerExchange — Process a peer list received from a connected peer.
+ * For each unknown peer, initiate a WebSocket connection.
+ *
+ * @param {object} msg - The PEER_EXCHANGE message
+ */
+function handlePeerExchange(msg) {
+  const { peers: remotePeers, fromNodeId } = msg;
+  if (!Array.isArray(remotePeers)) return;
+
+  for (const rp of remotePeers) {
+    if (rp.nodeId === nodeId) continue;      // Don't connect to ourselves
+    if (peers.has(rp.nodeId)) continue;       // Already connected
+    const addr = `${rp.ip}:${rp.port}`;
+    if (discoveredAddresses.has(addr)) continue; // Already attempted
+
+    discoveredAddresses.add(addr);
+    addNetworkEvent(`Discovered ${rp.nodeId} via peer exchange from ${fromNodeId}`);
+    connectToPeer(rp.ip, rp.port, rp.nodeId, 1, fromNodeId);
   }
 }
 
@@ -430,6 +490,16 @@ wss.on('connection', (ws, req) => {
       });
 
       addNetworkEvent(`Node ${remotePeerId} connected (inbound) — ${peers.size} peers total`);
+
+      // Share our known peers so the new node discovers the full mesh instantly
+      sendPeerList(ws, remotePeerId);
+      return;
+    }
+
+    // ── PEER EXCHANGE handling ─────────────────────────────────────────
+    // When a peer shares their peer list, connect to any unknown peers.
+    if (msg.type === 'PEER_EXCHANGE') {
+      handlePeerExchange(msg);
       return;
     }
 
@@ -530,6 +600,9 @@ function connectToPeer(ip, port, peerId, attempt = 1, relayNodeId = null) {
 
     const via = relayNodeId ? ` (via relay ${relayNodeId})` : '';
     addNetworkEvent(`Connected to ${peerId} at ${addr} (outbound)${via} — ${peers.size} peers total`);
+
+    // Share our known peers so the remote node discovers the full mesh instantly
+    sendPeerList(ws, peerId);
   });
 
   ws.on('message', (data) => {
@@ -538,6 +611,12 @@ function connectToPeer(ip, port, peerId, attempt = 1, relayNodeId = null) {
       msg = JSON.parse(data.toString());
     } catch {
       return; // Ignore malformed messages
+    }
+
+    // ── PEER EXCHANGE handling on outbound connections ─────────────────
+    if (msg.type === 'PEER_EXCHANGE') {
+      handlePeerExchange(msg);
+      return;
     }
 
     // ── HEARTBEAT handling on outbound connections ─────────────────────
@@ -748,15 +827,18 @@ udpSocket.bind(UDP_PORT, () => {
   }
   addNetworkEvent(`UDP discovery listening on port ${UDP_PORT}`);
 
-  // ── STEP 2: Broadcast on ALL interfaces every 2 seconds ──────────────
-  setInterval(() => {
-    const announcement = JSON.stringify({
-      nodeId,
-      ip: lanIP,
-      wsPort: WS_PORT,
-    });
+  // ── STEP 2: Broadcast on ALL interfaces ──────────────────────────────
+  // Burst mode: 300ms for first 10 seconds (fast initial mesh formation)
+  // then slows to 2s steady state (low overhead once mesh is formed)
+  const announcement = JSON.stringify({ nodeId, ip: lanIP, wsPort: WS_PORT });
+
+  function scheduleBroadcast() {
+    const elapsed = Date.now() - startupTime;
+    const interval = elapsed < UDP_BURST_DURATION ? UDP_BURST_INTERVAL : UDP_STEADY_INTERVAL;
     broadcastOnAllInterfaces(announcement);
-  }, UDP_BROADCAST_INTERVAL);
+    setTimeout(scheduleBroadcast, interval);
+  }
+  scheduleBroadcast(); // start immediately
 });
 
 // Clean up relayedPeers cooldown entries to prevent memory leak
