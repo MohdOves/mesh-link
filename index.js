@@ -14,6 +14,7 @@
  *   6. Self Healing (built into close/error handlers — gossip IS the heal)
  *   7. Ink TUI (src/App.js)
  *   8. SOS Broadcast (Ctrl+S in TUI)
+ *   9. UDP Discovery Relay (multi-interface bridging for cross-subnet mesh)
  */
 
 import dgram from 'dgram';
@@ -36,6 +37,7 @@ const DEFAULT_MSG_TTL = 10;          // default hop limit for messages
 const RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;        // 2 seconds
 const HEARTBEAT_INTERVAL = 5000;     // 5 seconds between heartbeat pings
+const RELAY_COOLDOWN = 10000;        // 10 seconds between relaying same peer
 
 // Generate unique node ID: "node-" + 6 random hex chars
 const nodeId = 'node-' + crypto.randomBytes(3).toString('hex');
@@ -45,23 +47,54 @@ const cliPortArg = process.argv.find((a, i) => process.argv[i - 1] === '--port')
 const WS_PORT = cliPortArg ? parseInt(cliPortArg, 10) : 3000 + Math.floor(Math.random() * 1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UTILITY: Get this machine's LAN IP
+// UTILITY: Detect ALL network interfaces with per-interface broadcast addresses
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// A normal single-network device has one interface (e.g. 192.168.1.x).
+// A bridge device has two or more (e.g. 192.168.43.x on wlan0, 192.168.44.1
+// on wlan1-hotspot). We calculate the correct subnet-specific broadcast
+// address for each interface using the netmask.
+//
 
-function getLanIP() {
+function ipToInt(ip) {
+  return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
+}
+
+function intToIp(int) {
+  return [
+    (int >>> 24) & 0xFF,
+    (int >>> 16) & 0xFF,
+    (int >>> 8) & 0xFF,
+    int & 0xFF,
+  ].join('.');
+}
+
+function getLocalInterfaces() {
+  const result = [];
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name]) {
-      // Skip loopback and non-IPv4
       if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address;
+        // Calculate broadcast address: broadcast = (ip | ~netmask)
+        const ipInt = ipToInt(iface.address);
+        const maskInt = ipToInt(iface.netmask);
+        const broadcastInt = (ipInt | (~maskInt >>> 0)) >>> 0;
+        result.push({
+          name,
+          address: iface.address,
+          netmask: iface.netmask,
+          broadcast: intToIp(broadcastInt),
+        });
       }
     }
   }
-  return '127.0.0.1'; // fallback
+  return result;
 }
 
-const lanIP = getLanIP();
+const localInterfaces = getLocalInterfaces();
+// Primary LAN IP = first non-loopback interface, with fallback
+const lanIP = localInterfaces.length > 0 ? localInterfaces[0].address : '127.0.0.1';
+const isBridgeNode = localInterfaces.length > 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATE
@@ -98,6 +131,21 @@ const reconnectAttempts = new Map();
  * Tracks outgoing heartbeat pings awaiting ACK to measure RTT.
  */
 const pendingHeartbeats = new Map();
+
+/**
+ * relayedPeers Map: nodeId -> lastRelayedAt timestamp
+ * Tracks when we last relayed a peer's discovery info to prevent relay storms.
+ * A peer is only relayed once per RELAY_COOLDOWN (10 seconds).
+ */
+const relayedPeers = new Map();
+
+/**
+ * routingTable Map: unreachableNodeId -> relayNodeId
+ * When a direct WebSocket to a peer fails after RECONNECT_ATTEMPTS retries,
+ * we fall back to indirect routing through the relay node that originally
+ * told us about that peer. The gossip router checks this table.
+ */
+const routingTable = new Map();
 
 /**
  * chatMessages — array of { fromNodeId, text, type, hops, timestamp }
@@ -440,12 +488,13 @@ wss.on('connection', (ws, req) => {
 /**
  * connectToPeer — Open an outbound WebSocket connection to a discovered peer.
  *
- * @param {string} ip        - The peer's IP address
- * @param {number} port      - The peer's WebSocket server port
- * @param {string} peerId    - The peer's nodeId
- * @param {number} attempt   - Current attempt number (for reconnection)
+ * @param {string} ip           - The peer's IP address
+ * @param {number} port         - The peer's WebSocket server port
+ * @param {string} peerId       - The peer's nodeId
+ * @param {number} attempt      - Current attempt number (for reconnection)
+ * @param {string} relayNodeId  - nodeId of the relay that introduced this peer (for fallback routing)
  */
-function connectToPeer(ip, port, peerId, attempt = 1) {
+function connectToPeer(ip, port, peerId, attempt = 1, relayNodeId = null) {
   // Don't connect to ourselves
   if (peerId === nodeId) return;
 
@@ -473,10 +522,14 @@ function connectToPeer(ip, port, peerId, attempt = 1) {
       connectedAt: Date.now(),
     });
 
+    // Direct connection succeeded — remove from routingTable if present
+    routingTable.delete(peerId);
+
     // Reset reconnect counter on success
     reconnectAttempts.delete(addr);
 
-    addNetworkEvent(`Connected to ${peerId} at ${addr} (outbound) — ${peers.size} peers total`);
+    const via = relayNodeId ? ` (via relay ${relayNodeId})` : '';
+    addNetworkEvent(`Connected to ${peerId} at ${addr} (outbound)${via} — ${peers.size} peers total`);
   });
 
   ws.on('message', (data) => {
@@ -523,13 +576,22 @@ function connectToPeer(ip, port, peerId, attempt = 1) {
       setTimeout(() => {
         // Only reconnect if we still don't have a connection to this peer
         if (!peers.has(peerId)) {
-          connectToPeer(ip, port, peerId, currentAttempt + 1);
+          connectToPeer(ip, port, peerId, currentAttempt + 1, relayNodeId);
         }
       }, RECONNECT_DELAY);
     } else {
-      // Give up — remove from discovered so UDP can re-trigger later
+      // ── STEP 5: FALLBACK INDIRECT ROUTING ──────────────────────────
+      // Direct WebSocket failed after all retries. If a relay node
+      // introduced this peer, fall back to routing messages through
+      // that relay. The gossip router will handle forwarding via the
+      // relay node's WebSocket connection.
       discoveredAddresses.delete(addr);
       reconnectAttempts.delete(addr);
+
+      if (relayNodeId && peers.has(relayNodeId)) {
+        routingTable.set(peerId, relayNodeId);
+        addNetworkEvent(`Direct WS to ${peerId} failed — routing through relay ${relayNodeId}`);
+      }
     }
   });
 
@@ -540,17 +602,103 @@ function connectToPeer(ip, port, peerId, attempt = 1) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MODULE 1: UDP DISCOVERY
+// MODULE 1: UDP DISCOVERY + MODULE 9: DISCOVERY RELAY
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// On startup, the node broadcasts a UDP packet every 2 seconds on
-// 255.255.255.255:41234 containing its nodeId, LAN IP, and WS port.
-// Simultaneously listens for UDP broadcasts from other nodes.
-// When a new node is discovered (not in peers and not self), initiate
-// a WebSocket client connection to it.
+// On startup, the node broadcasts a UDP discovery packet every 2 seconds on
+// EVERY network interface's subnet-specific broadcast address.
+//
+// When a discovery packet arrives from a remote peer:
+//   1) If not already known, initiate a WebSocket connection to that peer.
+//   2) If this node is a bridge (multiple interfaces), RELAY the discovery
+//      to all OTHER interfaces so peers on different subnets learn about
+//      each other. Relayed packets are marked relayed:true to prevent storms.
+//   3) Relayed packets are processed identically for peer discovery but
+//      are NEVER re-relayed (depth = 1 hop max).
+//
+// Storm prevention:
+//   - relayedPeers Map tracks lastRelayedAt per nodeId (10s cooldown)
+//   - Packets already marked relayed:true are never re-relayed
+//   - A node never relays its own broadcasts
 //
 
 const udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+
+/**
+ * broadcastOnAllInterfaces — Send a UDP packet to every interface's broadcast
+ * address. This ensures the announcement reaches every subnet this device is
+ * connected to simultaneously.
+ *
+ * @param {Buffer|string} packet - The data to broadcast
+ */
+function broadcastOnAllInterfaces(packet) {
+  const buf = typeof packet === 'string' ? Buffer.from(packet) : packet;
+  for (const iface of localInterfaces) {
+    udpSocket.send(buf, 0, buf.length, UDP_PORT, iface.broadcast, () => {
+      // Silently ignore per-interface broadcast errors
+    });
+  }
+}
+
+/**
+ * relayPeerDiscovery — When we discover a peer on one interface, re-broadcast
+ * their existence on ALL OTHER interfaces. This is the core of cross-subnet
+ * bridging. Only called when we have multiple interfaces (isBridgeNode).
+ *
+ * @param {object} originalMsg   - The original discovery packet
+ * @param {string} sourceAddress - The IP the packet arrived from (so we skip
+ *                                  that interface's broadcast)
+ */
+function relayPeerDiscovery(originalMsg, sourceAddress) {
+  const remoteNodeId = originalMsg.nodeId;
+
+  // Storm prevention: only relay each peer once per RELAY_COOLDOWN
+  const lastRelayed = relayedPeers.get(remoteNodeId);
+  if (lastRelayed && (Date.now() - lastRelayed) < RELAY_COOLDOWN) {
+    return; // Already relayed recently — skip
+  }
+  relayedPeers.set(remoteNodeId, Date.now());
+
+  // Build the relayed packet — same peer info, but marked as relayed
+  const relayedPacket = JSON.stringify({
+    nodeId: originalMsg.nodeId,
+    ip: originalMsg.ip,
+    wsPort: originalMsg.wsPort,
+    relayed: true,
+    relayedBy: nodeId,
+  });
+
+  const buf = Buffer.from(relayedPacket);
+
+  // Determine which interface the source belongs to, so we skip it
+  const sourceIfaceBroadcast = getInterfaceBroadcastForSource(sourceAddress);
+
+  // Broadcast on all interfaces EXCEPT the one the packet came from
+  for (const iface of localInterfaces) {
+    if (iface.broadcast === sourceIfaceBroadcast) continue;
+    udpSocket.send(buf, 0, buf.length, UDP_PORT, iface.broadcast, () => {});
+  }
+
+  addNetworkEvent(`Relayed ${remoteNodeId} discovery to ${localInterfaces.length - 1} other interface(s)`);
+}
+
+/**
+ * getInterfaceBroadcastForSource — Given a source IP, find which of our
+ * local interfaces it belongs to (same subnet). Returns the broadcast
+ * address for that interface.
+ */
+function getInterfaceBroadcastForSource(sourceIP) {
+  const srcInt = ipToInt(sourceIP);
+  for (const iface of localInterfaces) {
+    const ifaceInt = ipToInt(iface.address);
+    const maskInt = ipToInt(iface.netmask);
+    // Same subnet if (srcIP & mask) === (ifaceIP & mask)
+    if ((srcInt & maskInt) === (ifaceInt & maskInt)) {
+      return iface.broadcast;
+    }
+  }
+  return null; // Unknown subnet — relay to all
+}
 
 udpSocket.on('message', (data, rinfo) => {
   let msg;
@@ -561,18 +709,28 @@ udpSocket.on('message', (data, rinfo) => {
   }
 
   const { nodeId: remoteNodeId, ip: remoteIP, wsPort: remotePort } = msg;
+  const isRelayed = msg.relayed === true;
+  const relayedBy = msg.relayedBy || null;
 
   // Ignore our own broadcasts
   if (remoteNodeId === nodeId) return;
 
   const addr = `${remoteIP}:${remotePort}`;
 
-  // If we haven't seen this address and don't already have this peer,
-  // initiate a WebSocket connection.
+  // ── STEP 4: Handle relayed discovery packets ─────────────────────────
+  // Process relayed packets identically for peer discovery.
+  // The only difference: do NOT re-relay them (max relay depth = 1).
   if (!discoveredAddresses.has(addr) && !peers.has(remoteNodeId)) {
     discoveredAddresses.add(addr);
-    addNetworkEvent(`Discovered ${remoteNodeId} at ${addr} via UDP`);
-    connectToPeer(remoteIP, remotePort, remoteNodeId);
+    const via = isRelayed ? ` (via relay ${relayedBy})` : '';
+    addNetworkEvent(`Discovered ${remoteNodeId} at ${addr}${via}`);
+    connectToPeer(remoteIP, remotePort, remoteNodeId, 1, relayedBy);
+  }
+
+  // ── STEP 3: Relay to other interfaces if we are a bridge node ────────
+  // Only relay DIRECT broadcasts (not already relayed) to prevent storms.
+  if (!isRelayed && isBridgeNode) {
+    relayPeerDiscovery(msg, rinfo.address);
   }
 });
 
@@ -582,21 +740,34 @@ udpSocket.on('error', (err) => {
 
 udpSocket.bind(UDP_PORT, () => {
   udpSocket.setBroadcast(true);
+
+  // Log detected interfaces
+  if (localInterfaces.length > 1) {
+    const ifaceList = localInterfaces.map(i => `${i.address} (${i.name}→${i.broadcast})`).join(', ');
+    addNetworkEvent(`Bridge node detected — ${localInterfaces.length} interfaces: ${ifaceList}`);
+  }
   addNetworkEvent(`UDP discovery listening on port ${UDP_PORT}`);
 
-  // Broadcast our presence every 2 seconds
+  // ── STEP 2: Broadcast on ALL interfaces every 2 seconds ──────────────
   setInterval(() => {
     const announcement = JSON.stringify({
       nodeId,
       ip: lanIP,
       wsPort: WS_PORT,
     });
-
-    udpSocket.send(announcement, 0, announcement.length, UDP_PORT, '255.255.255.255', () => {
-      // Silently ignore broadcast errors
-    });
+    broadcastOnAllInterfaces(announcement);
   }, UDP_BROADCAST_INTERVAL);
 });
+
+// Clean up relayedPeers cooldown entries to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of relayedPeers) {
+    if (now - ts > RELAY_COOLDOWN * 3) {
+      relayedPeers.delete(id);
+    }
+  }
+}, 30000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODULE 5: HEARTBEAT (Latency Measurement)
